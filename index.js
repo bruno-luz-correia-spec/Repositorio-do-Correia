@@ -1,3 +1,4 @@
+// index.js
 const express = require('express');
 const cheerio = require('cheerio');
 const app = express();
@@ -21,7 +22,6 @@ const BR_FIIS = [
 const US_ETFS = ['IVV','BIL','SCHD'];
 const GERAL   = ['SELIC HOJE','DOLAR','BITCOIN'];
 
-// todos os símbolos
 const ALL = [...GERAL, ...BR_STOCKS, ...BR_FIIS, ...US_ETFS];
 const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
 
@@ -33,11 +33,11 @@ ALL.forEach(sym => cache.set(sym, { changePct: null, price: null, ts: 0 }));
 function parseLocaleNumber(str) {
   if (!str) return NaN;
   let s = str.trim().replace(/[^\d.,\-+]/g, '');
-  const c = s.lastIndexOf(','), d = s.lastIndexOf('.');
-  if (c > -1 && d > -1) {
-    if (c > d) s = s.replace(/\./g,'').replace(',','.');
-    else      s = s.replace(/,/g,'');
-  } else if (c > -1) {
+  const comma = s.lastIndexOf(','), dot = s.lastIndexOf('.');
+  if (comma > -1 && dot > -1) {
+    if (comma > dot) s = s.replace(/\./g,'').replace(',','.');
+    else            s = s.replace(/,/g,'');
+  } else if (comma > -1) {
     s = s.replace(/\./g,'').replace(',','.');
   } else {
     s = s.replace(/,/g,'');
@@ -46,43 +46,25 @@ function parseLocaleNumber(str) {
   return Number.isFinite(n) ? n : NaN;
 }
 
-// scrape de par de moeda/crypo ex: "USD-BRL", "BTC-BRL"
-async function scrapeGoogleCurrency(pair) {
+// faz scrape no Google Finance para preço e variação
+async function scrapeGoogle(sym, suffix = '') {
   try {
-    const url = `https://www.google.com/finance/quote/${encodeURIComponent(pair)}?hl=pt-BR`;
+    const url = `https://www.google.com/finance/quote/${encodeURIComponent(sym)}${suffix}?hl=pt-BR`;
     const res = await fetchFn(url, {
-      headers:{ 'User-Agent':'Mozilla/5.0', 'Accept-Language':'pt-BR' }
+      headers: { 'User-Agent':'Mozilla/5.0', 'Accept-Language':'pt-BR' }
     });
     if (!res.ok) return null;
     const $ = cheerio.load(await res.text());
     const txt = $('div.YMlKec.fxKbKc').first().text().trim();
-    const num = parseLocaleNumber(txt);
-    return Number.isFinite(num) ? num : null;
+    return parseLocaleNumber(txt) || null;
   } catch {
     return null;
   }
 }
 
-// suffix de mercado para Google Finance
+// determina sufixo para ações/ETFs
 function marketSuffix(sym) {
-  return US_ETFS.includes(sym) ? 'NYSEARCA' : 'BVMF';
-}
-
-// scrape de preço para ações, FIIs e ETFs
-async function scrapeGooglePrice(sym) {
-  try {
-    const url = `https://www.google.com/finance/quote/${encodeURIComponent(sym)}:${marketSuffix(sym)}?hl=pt-BR`;
-    const res = await fetchFn(url, {
-      headers:{ 'User-Agent':'Mozilla/5.0', 'Accept-Language':'pt-BR' }
-    });
-    if (!res.ok) return null;
-    const $ = cheerio.load(await res.text());
-    const txt = $('div.YMlKec.fxKbKc').first().text().trim();
-    const num = parseLocaleNumber(txt);
-    return Number.isFinite(num) ? num : null;
-  } catch {
-    return null;
-  }
+  return US_ETFS.includes(sym) ? ':NYSEARCA' : ':BVMF';
 }
 
 // busca fechamento anterior via brapi.dev
@@ -93,8 +75,7 @@ async function fetchPrevClose(sym) {
     const res = await fetchFn(url);
     if (!res.ok) return null;
     const js = await res.json();
-    const prev = Number(js.results?.[0]?.regularMarketPreviousClose ?? NaN);
-    return Number.isFinite(prev) ? prev : null;
+    return Number(js.results?.[0]?.regularMarketPreviousClose) || null;
   } catch {
     return null;
   }
@@ -107,47 +88,42 @@ async function fetchSelic() {
       'https://api.bcb.gov.br/dados/serie/bcdata.sgs.432/dados/ultimos/1?formato=json'
     );
     const j = await res.json();
-    const v = Number(j?.[0]?.valor ?? NaN);
-    return Number.isFinite(v) ? v : null;
+    return Number(j?.[0]?.valor) || null;
   } catch {
     return null;
   }
 }
 
-// atualiza um símbolo
+// atualiza um símbolo no cache
 async function updateSymbol(sym) {
-  // bloco GERAL
+  // Grupo GERAL
   if (GERAL.includes(sym)) {
-    // SELIC sempre fresh
     if (sym === 'SELIC HOJE') {
       const s = await fetchSelic();
       cache.set(sym, { changePct: null, price: s, ts: Date.now() });
-    }
-    // DÓLAR e BITCOIN a cada 10 min
-    if (sym === 'DOLAR' || sym === 'BITCOIN') {
+    } else {
       const entry = cache.get(sym);
       if (Date.now() - entry.ts < 10 * 60 * 1000) return;
       const pair = sym === 'DOLAR' ? 'USD-BRL' : 'BTC-BRL';
-      const price = await scrapeGoogleCurrency(pair);
+      const price = await scrapeGoogle(pair);
       let pct = null;
       if (price != null && Number.isFinite(entry.price)) {
-        pct = ((price - entry.price) / entry.price) * 100;
-        pct = clamp(pct, -50, 50);
+        pct = clamp((price - entry.price) / entry.price * 100, -50, 50);
       }
       cache.set(sym, { changePct: pct, price, ts: Date.now() });
     }
     return;
   }
 
-  // ações, FIIs, ETFs (3min)
-  const price = await scrapeGooglePrice(sym);
+  // Ações, FIIs, ETFs
+  const price = await scrapeGoogle(sym, marketSuffix(sym));
   const prev  = await fetchPrevClose(sym);
   let pct = null;
   if (price != null && prev != null && prev !== 0) {
-    pct = ((price - prev) / prev) * 100;
+    pct = clamp((price - prev) / prev * 100, -50, 50);
   }
   cache.set(sym, {
-    changePct: pct != null ? clamp(pct, -50, 50) : null,
+    changePct: pct,
     price: price != null ? price : cache.get(sym).price,
     ts: Date.now()
   });
@@ -155,129 +131,116 @@ async function updateSymbol(sym) {
 
 // ciclo de atualização
 async function updateAll() {
-  console.log('=== Atualização', new Date().toLocaleTimeString(), '===');
   for (const sym of ALL) {
     await updateSymbol(sym);
-    await new Promise(r => setTimeout(r, 500));
+    // espaçamento para não bloquear Google
+    await new Promise(r => setTimeout(r, 400));
   }
-  console.log('=== Fim do ciclo ===\n');
 }
-
 updateAll();
-setInterval(updateAll, 3 * 60 * 1000);  // a cada 3 minutos
+setInterval(updateAll, 3 * 60 * 1000);
 
 // API /api/heatmap
 app.get('/api/heatmap', (req, res) => {
   const make = arr => arr
     .map(sym => ({
-      symbol:    sym,
+      symbol: sym,
       changePct: cache.get(sym).changePct,
-      price:     cache.get(sym).price
+      price: cache.get(sym).price
     }))
     .sort((a, b) => (b.changePct ?? -Infinity) - (a.changePct ?? -Infinity));
 
   res.json({
     updatedAt: new Date().toISOString(),
     groups: [
-      { name: 'GERAL',               items: make(GERAL) },
-      { name: 'Ações Brasileiras',   items: make(BR_STOCKS) },
-      { name: 'Fundos Imobiliários', items: make(BR_FIIS) },
-      { name: 'ETFs Americanos',     items: make(US_ETFS) }
+      { name: 'GERAL',               items: make(GERAL)    },
+      { name: 'Ações Brasileiras',   items: make(BR_STOCKS)},
+      { name: 'Fundos Imobiliários', items: make(BR_FIIS)  },
+      { name: 'ETFs Americanos',     items: make(US_ETFS)  }
     ]
   });
 });
 
-// painel HTML com hora e data da última atualização
+// Rota principal com grid de 6 colunas em Ações Brasileiras
 app.get('/', (req, res) => {
-  const html = `<!doctype html>
-<html lang="pt-BR"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Heatmap Pro</title>
-<style>
-  body { margin:0; background:#0b0f14; font-family:sans-serif; color:#000; }
-  .screen { display:grid; grid-template-rows:repeat(4,1fr); min-height:100vh; gap:10px; padding:10px; }
-  .group { position:relative; border-radius:12px; background:rgba(255,255,255,0.05); }
-  .group-label { position:absolute; top:8px; left:10px; font-size:12px;
-    background:rgba(255,255,255,0.08); padding:6px 10px; border-radius:999px;
-    color:#c8d1da; font-weight:600; }
-  .grid { position:absolute; inset:0; padding:30px 10px 10px;
-    display:grid; grid-template-columns:repeat(auto-fit,minmax(110px,1fr));
-    grid-auto-rows:100px; gap:10px; }
-  .tile { border-radius:15px; display:flex; flex-direction:column;
-    justify-content:space-between; padding:14px; background:#cfcfcf; color:#000;
-    box-shadow:inset 0 0 8px rgba(0,0,0,0.15);
-    transition:background-color .3s ease; }
-  .tile-symbol { font-weight:900; font-size:18px; }
-  .tile-meta { display:flex; justify-content:space-between; font-weight:700; font-size:14px; }
-  .last-update { position:absolute; bottom:8px; right:10px; color:#c8d1da; font-size:12px; }
-</style>
-</head><body>
-<div class="screen">
-  <section class="group"><div class="group-label">GERAL</div><div class="grid" id="grid-geral"></div></section>
-  <section class="group"><div class="group-label">AÇÕES BRASILEIRAS</div><div class="grid" id="grid-br"></div></section>
-  <section class="group"><div class="group-label">FUNDOS IMOBILIÁRIOS</div><div class="grid" id="grid-fiis"></div></section>
-  <section class="group"><div class="group-label">ETFs AMERICANOS</div><div class="grid" id="grid-us"></div></section>
-</div>
-<div class="last-update" id="last-update"></div>
-<script>
-  function clamp(n,min,max){ return Math.max(min, Math.min(max, n)) }
-  function pctToColor(p){
-    const pct = clamp(p ?? 0, -5, 5);
-    if (isNaN(pct)) return "#cfcfcf";
-    if (pct === 0) return "#ffffff";
-    const to   = pct>0 ? [0,150,0] : [220,0,0],
-          from = [255,255,255],
-          t    = Math.abs(pct)/5;
-    return "rgb(" +
-      [0,1,2].map(i => Math.round(from[i] + (to[i] - from[i]) * t)).join(",") +
-      ")";
-  }
-  function tile(sym,pct,price){
-    const d = document.createElement("div"); d.className = "tile";
-    d.style.background = pct==null ? "#cfcfcf" : pctToColor(pct);
-    const pctTxt = pct==null ? "—" : (pct>0 ? "+" : "") + pct.toFixed(2) + "%";
-    let priceTxt;
-    if (sym === "SELIC HOJE") priceTxt = price!=null ? price.toFixed(2) + "%" : "—";
-    else priceTxt = price!=null
-      ? "R$ " + price.toLocaleString("pt-BR",{ minimumFractionDigits:2, maximumFractionDigits:2 })
-      : "—";
-    d.innerHTML = 
-      '<div class="tile-symbol">' + sym + '</div>' +
-      '<div class="tile-meta"><span>' + pctTxt + '</span><span>' + priceTxt + '</span></div>';
-    return d;
-  }
-  function render(groups){
-    const ids = {
-      "GERAL":"grid-geral",
-      "Ações Brasileiras":"grid-br",
-      "Fundos Imobiliários":"grid-fiis",
-      "ETFs Americanos":"grid-us"
-    };
-    groups.forEach(g=>{
-      const grid = document.getElementById(ids[g.name]);
-      grid.innerHTML = "";
-      g.items.forEach(x=>grid.appendChild(tile(x.symbol,x.changePct,x.price)));
+  let html = '<!doctype html>';
+  html += '<html lang="pt-BR"><head>';
+  html += '<meta charset="utf-8">';
+  html += '<meta name="viewport" content="width=device-width,initial-scale=1">';
+  html += '<title>Heatmap Pro</title>';
+  html += '<style>';
+  html += 'body{margin:0;background:#0b0f14;color:#fff;font-family:sans-serif;}';
+  html += '.screen-wrapper{max-width:1200px;margin:0 auto;padding:10px;}';
+  html += '.screen{display:grid;grid-template-rows:1fr 1fr;gap:12px;}';
+  html += '.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));';
+  html += 'grid-auto-rows:90px;gap:8px;padding:30px 10px 10px;}';
+  html += '#grid-br{grid-template-columns:repeat(6,minmax(100px,1fr));}';
+  html += '.group{position:relative;border-radius:8px;background:rgba(255,255,255,0.05);}';
+  html += '.group-label{font-size:14px;padding:8px 12px;';
+  html += 'background:rgba(255,255,255,0.08);color:#c8d1da;cursor:pointer;}';
+  html += '.tile{border-radius:12px;display:flex;flex-direction:column;';
+  html += 'justify-content:space-between;background:#cfcfcf;color:#000;';
+  html += 'padding:10px;box-shadow:inset 0 0 6px rgba(0,0,0,0.15);transition:background .3s;}';
+  html += '.tile-symbol{font-size:16px;font-weight:700;}';
+  html += '.tile-meta{display:flex;justify-content:space-between;';
+  html += 'font-size:12px;font-weight:600;}';
+  html += '.tile:hover::after{content:attr(data-tooltip);position:absolute;';
+  html += 'top:6px;left:6px;background:rgba(0,0,0,0.75);color:#fff;';
+  html += 'padding:4px 6px;border-radius:4px;white-space:nowrap;';
+  html += 'font-size:10px;z-index:10;}';
+  html += '.last-update{position:fixed;bottom:0;left:0;right:0;';
+  html += 'background:rgba(0,0,0,0.7);text-align:center;padding:5px 0;';
+  html += 'font-size:12px;color:#c8d1da;}';
+  html += '</style></head><body>';
+  html += '<div class="screen-wrapper"><div class="screen">';
+  ['GERAL','Ações Brasileiras','Fundos Imobiliários','ETFs Americanos']
+    .forEach(name => {
+      const id = name === 'Ações Brasileiras' ? 'grid-br'
+                : name === 'GERAL'              ? 'grid-geral'
+                : name === 'Fundos Imobiliários'? 'grid-fiis'
+                : 'grid-us';
+      html += '<section class="group">';
+      html += `<div class="group-label">${name}</div>`;
+      html += `<div class="grid" id="${id}"></div>`;
+      html += '</section>';
     });
-  }
-  async function load(){
-    try {
-      const res = await fetch("/api/heatmap",{ cache:"no-store" });
-      const data = await res.json();
-      render(data.groups);
-      const lu = new Date(data.updatedAt);
-      document.getElementById("last-update").textContent =
-        "Última atualização: " + lu.toLocaleString("pt-BR");
-    } catch(e){
-      console.error("Falha ao carregar /api/heatmap", e);
-    }
-  }
-  load();
-  setInterval(load, 15000);
-</script>
-</body></html>`;
+  html += '</div></div>';
+  html += '<div class="last-update" id="last-update"></div>';
+  html += '<script>';
+  html += 'function clamp(n,min,max){return Math.max(min,Math.min(max,n));}';
+  html += 'function pctToColor(p){var pct=clamp(p||0,-3,3);if(isNaN(pct))return"#cfcfcf";';
+  html += 'if(pct===0)return"#fff";var to=pct>0?[0,150,0]:[220,0,0],from=[255,255,255],';
+  html += 't=Math.abs(pct)/3;return"rgb("+[0,1,2].map(i=>Math.round(from[i]+(to[i]-from[i])*t)).join(",")+")";}';
+  html += 'function tile(sym,pct,price){';
+  html += 'var d=document.createElement("div");d.className="tile";';
+  html += 'd.style.background=pct==null?"#cfcfcf":pctToColor(pct);';
+  html += 'var pctTxt=pct==null?"—":(pct>0?"+":"")+pct.toFixed(2)+"%";';
+  html += 'var priceTxt=sym==="SELIC HOJE"?';
+  html += '(price!=null?price.toFixed(2)+"%":"—")';
+  html += ':';
+  html += '(price!=null?"R$ "+price.toLocaleString("pt-BR",{minimumFractionDigits:2,maximumFractionDigits:2}):"—");';
+  html += 'd.innerHTML="<div class=\'tile-symbol\'>"+sym+"</div>"+"<div class=\'tile-meta\'><span>"+pctTxt+"</span><span>"+priceTxt+"</span></div>";';
+  html += 'd.setAttribute("data-tooltip",sym+" | "+pctTxt+" | "+priceTxt);return d;}';
+  html += 'function render(groups){';
+  html += 'var ids={"GERAL":"grid-geral","Ações Brasileiras":"grid-br",';
+  html += '"Fundos Imobiliários":"grid-fiis","ETFs Americanos":"grid-us"};';
+  html += 'groups.forEach(function(g){';
+  html += 'var grid=document.getElementById(ids[g.name]);grid.innerHTML="";';
+  html += 'g.items.forEach(function(x){grid.appendChild(tile(x.symbol,x.changePct,x.price));});});}';
+  html += 'async function load(){try{';
+  html += 'var res=await fetch("/api/heatmap",{cache:"no-store"});';
+  html += 'var data=await res.json();render(data.groups);';
+  html += 'document.getElementById("last-update").textContent=';
+  html += '"Última atualização: "+new Date(data.updatedAt).toLocaleString("pt-BR");';
+  html += '}catch(e){console.error(e);} }';
+  html += 'document.querySelectorAll(".group-label").forEach(function(lbl){';
+  html += 'lbl.addEventListener("click",function(){';
+  html += 'var g=lbl.nextElementSibling;';
+  html += 'g.style.display=g.style.display==="none"?"":"none";});});';
+  html += 'load();setInterval(load,15000);';
+  html += '</script></body></html>';
   res.type("html").send(html);
 });
 
-// inicia servidor
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("Rodando na porta " + PORT));
